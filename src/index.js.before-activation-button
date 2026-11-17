@@ -1,0 +1,469 @@
+const { Telegraf, Markup } = require('telegraf');
+const config = require('./config');
+const store = require('./store');
+const { QureoRunner } = require('./qureo');
+const { generateImage } = require('./image-generator');
+
+const bot = new Telegraf(config.token);
+
+async function sendGeneratedPhoto(ctx, image) {
+  const isJpeg = image[0] === 0xff && image[1] === 0xd8;
+  const mime = isJpeg ? 'image/jpeg' : 'image/png';
+  const filename = isJpeg ? 'qureo-image.jpg' : 'qureo-image.png';
+
+  const form = new FormData();
+  form.append('chat_id', String(ctx.chat.id));
+  form.append('photo', new Blob([image], { type: mime }), filename);
+  form.append('caption', 'تم إنشاء الصورة.');
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${config.token}/sendPhoto`,
+    { method: 'POST', body: form, signal: AbortSignal.timeout(30000) }
+  );
+
+  const result = await response.json();
+  if (!response.ok || !result.ok) {
+    throw new Error(result.description || `Telegram HTTP ${response.status}`);
+  }
+  return result;
+}
+const flows = new Map();
+const runners = new Map();
+const isAdmin = id => String(id) === config.adminId;
+const adminOnly = ctx => isAdmin(ctx.from?.id);
+const fmtDate = value => value ? new Date(value).toLocaleString('ar-EG', { dateStyle: 'short', timeStyle: 'short' }) : '—';
+const backButton = () => Markup.inlineKeyboard([[Markup.button.callback('↩️ الرئيسية', 'adm:home')]]);
+
+function userMenuKeyboard(admin = false) {
+  const rows = [
+    [Markup.button.callback('🔗 ربط حساب Qureo', 'usr:connect')],
+    [Markup.button.callback('🚀 بدء التدريب', 'usr:run'), Markup.button.callback('⏹ إيقاف التشغيل', 'usr:stop')],
+    [Markup.button.callback('📊 حالة التشغيل', 'usr:status'), Markup.button.callback('🔌 فصل الحساب', 'usr:disconnect')],
+    [Markup.button.callback('🎨 توليد صورة', 'usr:image')],
+    [Markup.button.callback('❓ المساعدة', 'usr:help')]
+  ];
+  if (admin) rows.push([Markup.button.callback('👑 لوحة تحكم الإدارة', 'adm:open')]);
+  return Markup.inlineKeyboard(rows);
+}
+const panelKeyboard = () => {
+  const rows = [
+    [Markup.button.callback('📊 الإحصائيات', 'adm:stats'), Markup.button.callback('👥 المستخدمون', 'adm:users:0')],
+    [Markup.button.callback('🔐 طلبات التفعيل', 'adm:activation:requests')],
+    [Markup.button.callback('⚙️ حالة النظام', 'adm:health'), Markup.button.callback('🧾 سجل النشاط', 'adm:logs:0')],
+    [Markup.button.callback('📣 إرسال إعلان', 'adm:broadcast'), Markup.button.callback('🔄 تحديث اللوحة', 'adm:home')]
+  ];
+
+  const users = store.listUsers();
+
+  rows.push([Markup.button.callback(`━━━━ المستخدمون (${users.length}) ━━━━`, 'adm:users:0')]);
+
+  for (const u of users) {
+    rows.push([
+      Markup.button.callback(`👤 ${u.id}`, `adm:user:${u.id}`)
+    ]);
+    rows.push([
+      Markup.button.callback(u.blocked ? '✅ إلغاء الحظر' : '🚫 حظر', `adm:toggle:${u.id}`),
+      Markup.button.callback(u.paused ? '▶️ استئناف' : '⏸️ إيقاف مؤقت', `adm:pause:${u.id}`),
+      Markup.button.callback('🔑 تغيير الكود', `adm:newcode:${u.id}`)
+    ]);
+    rows.push([
+      Markup.button.callback('⏹ إيقاف الجلسة', `adm:stop:${u.id}`),
+      Markup.button.callback('🚀 تشغيل الجلسة', `adm:run:${u.id}`),
+      Markup.button.callback('🗑 حذف الدخول', `adm:forget:${u.id}`)
+    ]);
+  }
+
+  return Markup.inlineKeyboard(rows);
+};
+async function safeEdit(ctx, text, keyboard) {
+  try { return await ctx.editMessageText(text, keyboard); }
+  catch { return ctx.reply(text, keyboard); }
+}
+async function adminPanel(ctx, edit = false) {
+  const s = store.getStats();
+  const requests = store.listActivationRequests().length;
+  const text = `✦ لوحة تحكم QUREO ✦
+━━━━━━━━━━━━━━━━━━
+👥 المستخدمون: ${s.users}
+🔐 المفعّلون: ${s.activated}
+🚫 المحظورون: ${s.blocked}
+⏸️ الموقوفون مؤقتًا: ${s.paused}
+⚙️ التشغيلات المسجلة: ${s.runs}
+✅ الأسئلة المنجزة: ${s.completed}
+🟢 الجلسات النشطة الآن: ${runners.size}
+📨 طلبات التفعيل: ${requests}
+━━━━━━━━━━━━━━━━━━
+اختر القسم الذي تريد إدارته:`;
+  return edit ? safeEdit(ctx, text, panelKeyboard()) : ctx.reply(text, panelKeyboard());
+}
+function userKeyboard(userId) {
+  const blocked = store.isBlocked(userId);
+  const paused = store.isPaused(userId);
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(blocked ? '✅ إلغاء الحظر' : '🚫 حظر المستخدم', `adm:toggle:${userId}`)],
+    [Markup.button.callback(paused ? '▶️ استئناف المستخدم' : '⏸️ إيقاف مؤقت', `adm:pause:${userId}`)],
+    [Markup.button.callback('🔑 تغيير كود التفعيل', `adm:newcode:${userId}`)],
+    [Markup.button.callback('⏹ إيقاف جلسة المستخدم', `adm:stop:${userId}`)],
+    [Markup.button.callback('🚀 تشغيل جلسة المستخدم', `adm:run:${userId}`)],
+    [Markup.button.callback('🗑 حذف بيانات الدخول', `adm:forget:${userId}`)],
+    [Markup.button.callback('↩️ رجوع للمستخدمين', 'adm:users:0')]
+  ]);
+}
+async function showUser(ctx, id) {
+  const u = store.listUsers().find(x => x.id === id);
+  if (!u) return safeEdit(ctx, 'المستخدم غير موجود.', Markup.inlineKeyboard([[Markup.button.callback('رجوع', 'adm:users:0')]]));
+  const active = runners.has(id);
+  const text = `👤 ملف المستخدم
+━━━━━━━━━━━━
+المعرف: ${u.id}
+اسم Qureo: ${u.username || '—'}
+تاريخ الربط: ${fmtDate(u.joinedAt)}
+آخر نشاط: ${fmtDate(u.lastSeen)}
+التشغيلات: ${u.runs || 0}
+الأسئلة المنجزة: ${u.completed || 0}
+بيانات الدخول: ${u.hasCredentials ? 'محفوظة مشفرة' : 'غير موجودة'}
+التفعيل: ${u.activated ? 'مفعّل' : 'غير مفعّل'}
+الحظر: ${u.blocked ? 'محظور' : 'غير محظور'}
+الإيقاف المؤقت: ${u.paused ? 'موقوف' : 'غير موقوف'}
+الجلسة: ${active ? 'تعمل الآن' : 'متوقفة'}`;
+  return safeEdit(ctx, text, userKeyboard(id));
+}
+async function stopRunner(id) {
+  const runner = runners.get(String(id));
+  if (!runner) return false;
+  await runner.close().catch(() => {});
+  runners.delete(String(id));
+  return true;
+}
+function startRunner(userId, notifyChatId, initiatedByAdmin = false) {
+  const id = String(userId);
+  if (process.platform === 'android') return { ok: false, message: '⚠️ تشغيل متصفح Qureo غير مدعوم على Termux في أندرويد. لم تبدأ أي جلسة.' };
+  if (store.isBlocked(id)) return { ok: false, message: 'لا يمكن تشغيل حساب محظور.' };
+  if (store.isPaused(id)) return { ok: false, message: 'لا يمكن تشغيل حساب موقوف مؤقتًا.' };
+  if (!store.isActivated(id)) return { ok: false, message: 'هذا الحساب غير مفعّل.' };
+  if (runners.has(id)) return { ok: false, message: 'توجد جلسة نشطة بالفعل لهذا المستخدم.' };
+  const credentials = store.getCredentials(id);
+  if (!credentials) return { ok: false, message: 'لا توجد بيانات دخول محفوظة لهذا المستخدم.' };
+
+  const runner = new QureoRunner(id, credentials, message =>
+    bot.telegram.sendMessage(notifyChatId, `👤 ${id}\n${message}`).catch(() => {})
+  );
+  runners.set(id, runner);
+  (async () => {
+    let count = 0, outcome = 'completed';
+    try {
+      await bot.telegram.sendMessage(notifyChatId, `🚀 بدأ تشغيل جلسة المستخدم ${id}. الاستخدام للتدريبات غير المُقيّمة فقط.`);
+      count = await runner.run();
+      await bot.telegram.sendMessage(notifyChatId, `🏁 انتهت جلسة ${id}. الأسئلة التي تأكد إنجازها: ${count}.`).catch(() => {});
+    } catch (e) {
+      outcome = e.code || e.message || 'error';
+      const msg = e.code === 'INVALID_CREDENTIALS'
+        ? `❌ بيانات تسجيل الدخول للمستخدم ${id} غير صحيحة.`
+        : `⛔ توقفت جلسة ${id} بأمان: ${e.message}`;
+      await bot.telegram.sendMessage(notifyChatId, msg).catch(() => {});
+    } finally {
+      store.recordRun(id, count, outcome);
+      await runner.close().catch(() => {});
+      if (runners.get(id) === runner) runners.delete(id);
+    }
+  })();
+  return { ok: true, message: `تم إرسال طلب تشغيل جلسة المستخدم ${id}.` };
+}
+
+bot.use(async (ctx, next) => {
+  const id = ctx.from?.id;
+  if (!id || isAdmin(id)) return next();
+  if (store.isBlocked(id)) {
+    if (ctx.callbackQuery) return ctx.answerCbQuery('حسابك محظور.');
+    return ctx.reply('🚫 حسابك محظور من استخدام البوت.');
+  }
+  const text = ctx.message?.text || '';
+  const isStart = /^\/start(?:@\w+)?(?:\s|$)/i.test(text);
+  const isActivate = /^\/activate(?:@\w+)?(?:\s|$)/i.test(text);
+  const isStatus = /^\/status(?:@\w+)?(?:\s|$)/i.test(text);
+  const isHelp = /^\/help(?:@\w+)?(?:\s|$)/i.test(text);
+  if (store.isPaused(id) && !isStart && !isStatus && !isHelp) {
+    if (ctx.callbackQuery) return ctx.answerCbQuery('حسابك موقوف مؤقتًا.');
+    return ctx.reply('⏸️ حسابك موقوف مؤقتًا من الإدارة.');
+  }
+  if (store.isActivated(id) || isStart || isActivate || ctx.callbackQuery?.data === 'act:request') return next();
+  if (ctx.callbackQuery) return ctx.answerCbQuery('يجب تفعيل حسابك أولًا.');
+  return ctx.reply('🔒 حسابك غير مفعّل. استخدم /start لطلب رمز التفعيل.');
+});
+
+
+bot.start(async ctx => {
+  const id = String(ctx.from.id);
+  if (store.isPaused(id)) return ctx.reply('⏸️ حسابك موقوف مؤقتًا من الإدارة.');
+  if (isAdmin(id) || store.isActivated(id)) {
+    return ctx.reply('أهلًا بك في مساعد تدريبات Qureo.\nاستخدم الأزرار لإدارة حسابك. يُستخدم للتدريبات غير المُقيّمة فقط.', userMenuKeyboard(isAdmin(id)));
+  }
+  return ctx.reply('🔐 أهلاً بك. هذا البوت يتطلب رمز تفعيل خاصًا بحساب تيليجرام.', Markup.inlineKeyboard([
+    [Markup.button.callback('🔐 طلب رمز تفعيل', 'act:request')],
+    [Markup.button.url('💬 التواصل مع المطوّر', 'https://t.me/Mr1Mo1')]
+  ]));
+});
+bot.command('activate', async ctx => {
+  const code = String(ctx.message.text || '').trim().split(/\s+/)[1];
+  if (!code) return ctx.reply('استخدم الأمر هكذا: /activate ثم مسافة ثم رمز التفعيل الذي وصلك.');
+  const result = store.activateUser(ctx.from.id, code);
+  if (result.ok) return ctx.reply('✅ تم تفعيل حسابك بنجاح.', userMenuKeyboard());
+  if (result.reason === 'compromised') {
+    if (result.ownerId) {
+      await ctx.telegram.sendMessage(result.ownerId, '🚨 تنبيه أمني: تم رصد محاولة استخدام رمز التفعيل الخاص بك من حساب آخر. تم تعطيل الرمز. تواصل مع الإدارة عبر @Mr1Mo1 لإصدار رمز جديد.').catch(() => {});
+      await ctx.telegram.sendMessage(config.adminId, `🚨 تنبيه أمني: رمز المستخدم ${result.ownerId} استُخدم من حساب آخر، وتم تعطيل التفعيل.`).catch(() => {});
+    }
+    return ctx.reply('🚨 تعذر التفعيل. تم اعتبار الرمز مُسرّبًا وتعطيله لحماية صاحبه. تواصل مع المطوّر.');
+  }
+  return ctx.reply(result.reason === 'used' ? 'هذا الرمز سبق استخدامه أو تم استبداله.' : 'رمز التفعيل غير صحيح.');
+});
+bot.action('act:request', async ctx => {
+  const id = String(ctx.from.id);
+  const result = store.requestActivation(id);
+  await ctx.answerCbQuery(result === 'pending' ? 'طلبك مسجل بالفعل' : 'تم إرسال الطلب');
+  if (result === 'activated') return ctx.reply('حسابك مفعّل بالفعل.');
+  if (result === 'created') {
+    await ctx.telegram.sendMessage(config.adminId, `📨 طلب تفعيل جديد\nمعرف المستخدم: ${id}`, Markup.inlineKeyboard([
+      [Markup.button.callback('فتح طلبات التفعيل', 'adm:activation:requests')]
+    ])).catch(() => {});
+  }
+  return ctx.reply('تم تسجيل طلبك. انتظر مراجعة الإدارة.');
+});
+bot.command('help', ctx => ctx.reply('/connect — ربط حساب Qureo\n/run — بدء التدريب غير المُقيّم\n/stop — إيقاف التشغيل\n/status — حالة التشغيل\n/disconnect — حذف بيانات الدخول\n/activate — تفعيل الحساب'));
+bot.command('connect', async ctx => {
+  const id = String(ctx.from.id);
+  if (store.isBlocked(id) || store.isPaused(id)) return ctx.reply('لا يمكن ربط الحساب في الوقت الحالي.');
+  if (!isAdmin(id) && !store.isActivated(id)) return ctx.reply('فعّل حسابك أولًا باستخدام /activate.');
+  flows.set(id, { step: 'username' });
+  return ctx.reply('🔐 أرسل اسم مستخدم Qureo في رسالة منفصلة. بعد ذلك أرسل كلمة المرور؛ سيحاول البوت حذف رسالة كلمة المرور فورًا، لكن الحذف غير مضمون في كل الظروف.');
+});
+bot.command('run', async ctx => {
+  const id = String(ctx.from.id);
+  const result = startRunner(id, ctx.chat.id);
+  return ctx.reply(result.message);
+});
+bot.command('stop', async ctx => {
+  const stopped = await stopRunner(ctx.from.id);
+  return ctx.reply(stopped ? 'تم إيقاف الجلسة.' : 'لا توجد جلسة نشطة.');
+});
+bot.command('status', ctx => {
+  const id = String(ctx.from.id);
+  return ctx.reply(runners.has(id) ? '🟢 حالة حسابك: يعمل الآن.' : '⚪ حالة حسابك: متوقف.');
+});
+bot.command('disconnect', async ctx => {
+  const id = String(ctx.from.id);
+  await stopRunner(id);
+  store.removeCredentials(id);
+  flows.delete(id);
+  return ctx.reply('تم حذف بيانات الدخول المحفوظة من قاعدة بيانات البوت.');
+});
+bot.command('image', async ctx => {
+  const id = String(ctx.from.id);
+  if (!isAdmin(id) && !store.isActivated(id)) return ctx.reply('فعّل حسابك أولًا.');
+  if (store.isBlocked(id) || store.isPaused(id)) return ctx.reply('لا يمكن استخدام الخدمة حاليًا.');
+  const prompt = String(ctx.message.text || '').replace(/^\/image(?:@\w+)?\s*/i, '').trim();
+  if (!prompt) {
+    flows.set(id, { step: 'image' });
+    return ctx.reply('اكتب وصف الصورة التي تريد إنشاءها في رسالة تالية.');
+  }
+  await ctx.reply('🎨 جارٍ إنشاء الصورة...');
+  try {
+    const image = await generateImage(prompt);
+    return sendGeneratedPhoto(ctx, image);
+  } catch (e) {
+    return ctx.reply(`تعذر إنشاء الصورة: ${e.message}`);
+  }
+});
+bot.action('usr:image', async ctx => {
+  await ctx.answerCbQuery();
+  flows.set(String(ctx.from.id), { step: 'image' });
+  return ctx.reply('اكتب وصف الصورة التي تريد إنشاءها.');
+});
+bot.command('panel', async ctx => {
+  if (!adminOnly(ctx)) return ctx.reply('غير مصرح لك.');
+  return adminPanel(ctx);
+});
+
+bot.action('usr:connect', async ctx => { await ctx.answerCbQuery(); return ctx.reply('استخدم /connect لربط حساب Qureo.'); });
+bot.action('usr:run', async ctx => { await ctx.answerCbQuery(); const r = startRunner(ctx.from.id, ctx.chat.id); return ctx.reply(r.message); });
+bot.action('usr:stop', async ctx => { const ok = await stopRunner(ctx.from.id); await ctx.answerCbQuery(ok ? 'تم الإيقاف' : 'لا توجد جلسة'); });
+bot.action('usr:status', async ctx => { const active = runners.has(String(ctx.from.id)); await ctx.answerCbQuery(active ? 'الجلسة تعمل' : 'الجلسة متوقفة', { show_alert: true }); });
+bot.action('usr:disconnect', async ctx => { const id = String(ctx.from.id); await stopRunner(id); store.removeCredentials(id); flows.delete(id); await ctx.answerCbQuery('تم فصل الحساب'); });
+bot.action('usr:help', async ctx => { await ctx.answerCbQuery(); return ctx.reply('/connect لربط الحساب، /run لبدء تدريب غير مُقيّم، /stop للإيقاف، /status للحالة، /disconnect للفصل.'); });
+
+bot.action('adm:open', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  return adminPanel(ctx);
+});
+bot.action('adm:home', async ctx => { if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح'); await ctx.answerCbQuery(); return adminPanel(ctx, true); });
+bot.action('adm:stats', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  const s = store.getStats();
+  return safeEdit(ctx, `📊 الإحصائيات\n━━━━━━━━━━━━\n👥 المستخدمون: ${s.users}\n🔐 المفعّلون: ${s.activated}\n🚫 المحظورون: ${s.blocked}\n⏸️ الموقوفون: ${s.paused}\n▶️ التشغيلات: ${s.runs}\n✅ الأسئلة المنجزة: ${s.completed}\n🟢 الجلسات النشطة: ${runners.size}`, backButton());
+});
+bot.action('adm:health', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  return safeEdit(ctx, `⚙️ حالة النظام\n━━━━━━━━━━━━\n🟢 Telegram: العملية تعمل\n🧠 Gemini: ${config.geminiKey ? 'مضبوط' : 'غير مضبوط'}\n🌐 Qureo: يتم اختباره عند بدء جلسة\n🟢 الجلسات النشطة: ${runners.size}\n💾 التخزين: AES-256-GCM\n⚠️ لا يعني ذلك أن تكامل Qureo اختُبر على حساب حقيقي.`, backButton());
+});
+bot.action(/^adm:users:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  const page = Number(ctx.match[1]), all = store.listUsers(), size = 8;
+  const items = all.slice(page * size, (page + 1) * size);
+  const rows = items.map(u => [Markup.button.callback(`${u.blocked ? '🚫' : u.paused ? '⏸️' : '👤'} ${u.id} · ${u.runs || 0} تشغيل`, `adm:user:${u.id}`)]);
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback('⬅️ السابق', `adm:users:${page - 1}`));
+  if ((page + 1) * size < all.length) nav.push(Markup.button.callback('التالي ➡️', `adm:users:${page + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('↩️ الرئيسية', 'adm:home')]);
+  return safeEdit(ctx, `👥 إدارة المستخدمين\nالعدد: ${all.length}\nالصفحة: ${page + 1}\nاختر مستخدمًا لعرض أدوات الإدارة:`, Markup.inlineKeyboard(rows));
+});
+bot.action(/^adm:user:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  return showUser(ctx, ctx.match[1]);
+});
+bot.action(/^adm:toggle:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1], blocked = !store.isBlocked(id);
+  store.setBlocked(id, blocked);
+  if (blocked) await stopRunner(id);
+  await ctx.answerCbQuery(blocked ? 'تم الحظر' : 'تم إلغاء الحظر');
+  return showUser(ctx, id);
+});
+bot.action(/^adm:pause:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1], paused = !store.isPaused(id);
+  store.setPaused(id, paused);
+  if (paused) await stopRunner(id);
+  await ctx.answerCbQuery(paused ? 'تم الإيقاف المؤقت' : 'تم الاستئناف');
+  return showUser(ctx, id);
+});
+async function issueCode(ctx, id) {
+  try {
+    const code = store.createActivationCode(id);
+    await ctx.telegram.sendMessage(id, code);
+    await ctx.telegram.sendMessage(id, 'هذا رمزك، لا تشاركه مع أحد.');
+    store.removeActivationRequest(id);
+    return { ok: true };
+  } catch (e) {
+    store.revokeActivation(id);
+    return { ok: false };
+  }
+}
+bot.action(/^adm:newcode:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1], result = await issueCode(ctx, id);
+  await ctx.answerCbQuery(result.ok ? 'تم إرسال رمز جديد' : 'تعذر إرسال الرمز');
+  return showUser(ctx, id);
+});
+bot.action(/^adm:stop:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1], stopped = await stopRunner(id);
+  await ctx.answerCbQuery(stopped ? 'تم إيقاف الجلسة' : 'لا توجد جلسة نشطة');
+  return showUser(ctx, id);
+});
+bot.action(/^adm:run:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1];
+  await ctx.answerCbQuery();
+  const result = startRunner(id, ctx.chat.id, true);
+  await ctx.reply(result.message);
+});
+bot.action(/^adm:forget:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1];
+  await stopRunner(id);
+  store.removeCredentials(id);
+  await ctx.answerCbQuery('تم حذف بيانات الدخول');
+  return showUser(ctx, id);
+});
+bot.action(/^adm:activation:requests$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  const requests = store.listActivationRequests();
+  const rows = requests.map(r => [Markup.button.callback(`👤 ${r.id} · إصدار وإرسال رمز`, `adm:activation:send:${r.id}`)]);
+  rows.push([Markup.button.callback('↩️ الرئيسية', 'adm:home')]);
+  return safeEdit(ctx, `🔐 طلبات التفعيل\nعدد الطلبات المعلقة: ${requests.length}\n${requests.length ? 'اختر طلبًا لإصدار رمز خاص بالحساب.' : 'لا توجد طلبات معلقة.'}`, Markup.inlineKeyboard(rows));
+});
+bot.action(/^adm:activation:send:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  const id = ctx.match[1], result = await issueCode(ctx, id);
+  await ctx.answerCbQuery(result.ok ? 'تم إرسال الرمز' : 'تعذر الإرسال');
+  if (!result.ok) return safeEdit(ctx, `تعذر إرسال رسالة إلى ${id}. اطلب منه فتح البوت وإرسال /start أولًا، ثم أعد المحاولة.`, Markup.inlineKeyboard([[Markup.button.callback('↩️ طلبات التفعيل', 'adm:activation:requests')]]));
+  return safeEdit(ctx, `✅ تم إرسال رمز تفعيل خاص بالمستخدم ${id}.`, Markup.inlineKeyboard([[Markup.button.callback('↩️ طلبات التفعيل', 'adm:activation:requests')], [Markup.button.callback('الرئيسية', 'adm:home')]]));
+});
+bot.action(/^adm:logs:(\d+)$/, async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  const s = store.getStats();
+  const lines = s.events.slice(Number(ctx.match[1]) * 8, (Number(ctx.match[1]) + 1) * 8)
+    .map(e => `${fmtDate(e.at)} · ${e.userId} · ${e.completed} سؤال · ${String(e.outcome).slice(0, 60)}`);
+  return safeEdit(ctx, `🧾 سجل النشاط\n━━━━━━━━━━━━\n${lines.join('\n') || 'لا توجد سجلات بعد.'}`, backButton());
+});
+bot.action('adm:broadcast', async ctx => {
+  if (!adminOnly(ctx)) return ctx.answerCbQuery('غير مصرح');
+  await ctx.answerCbQuery();
+  flows.set(String(ctx.from.id), { step: 'broadcast' });
+  return ctx.reply('اكتب نص الإعلان الذي تريد إرساله. اكتب /cancel للإلغاء.');
+});
+bot.command('cancel', ctx => { flows.delete(String(ctx.from.id)); return ctx.reply('تم إلغاء العملية الحالية.'); });
+
+bot.on('text', async ctx => {
+  const id = String(ctx.from.id), flow = flows.get(id);
+  if (!flow || ctx.message.text.startsWith('/')) return;
+  if (flow.step === 'broadcast' && adminOnly(ctx)) {
+    flows.delete(id);
+    const users = store.listUsers().filter(u => !u.blocked);
+    let sent = 0;
+    for (const u of users) {
+      try { await ctx.telegram.sendMessage(u.id, `📣 إعلان من الإدارة\n\n${ctx.message.text}`); sent++; } catch {}
+    }
+    return ctx.reply(`اكتمل الإرسال: وصل إلى ${sent} من ${users.length} مستخدم.`);
+  }
+  if (store.isBlocked(id) || store.isPaused(id) || (!isAdmin(id) && !store.isActivated(id))) {
+    flows.delete(id);
+    return ctx.reply('لا يمكن إكمال العملية؛ تحقق من حالة حسابك والتفعيل.');
+  }
+  if (flow.step === 'image') {
+    flows.delete(id);
+    await ctx.reply('🎨 جارٍ إنشاء الصورة...');
+    try {
+      const image = await generateImage(ctx.message.text);
+      return sendGeneratedPhoto(ctx, image);
+    } catch (e) {
+      return ctx.reply(`تعذر إنشاء الصورة: ${e.message}`);
+    }
+  }
+  if (flow.step === 'username') {
+    const username = ctx.message.text.trim();
+    if (!username || username.length > 200) return ctx.reply('اسم المستخدم غير صالح، حاول مرة أخرى.');
+    flow.username = username;
+    flow.step = 'password';
+    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+    return ctx.reply('وصل اسم المستخدم. أرسل كلمة المرور في رسالة منفصلة؛ سأحاول حذف رسالتها فورًا.');
+  }
+  if (flow.step === 'password') {
+    const password = ctx.message.text;
+    await ctx.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+    if (!password || password.length > 500) { flows.delete(id); return ctx.reply('كلمة المرور غير صالحة. ابدأ الربط من جديد باستخدام /connect.'); }
+    store.saveCredentials(id, flow.username, password);
+    flows.delete(id);
+    return ctx.reply('✅ تم حفظ بيانات الدخول مشفرة. استخدم /run لبدء تدريب غير مُقيّم.');
+  }
+});
+
+bot.catch(err => console.error('Telegram handler error:', err.message));
+async function shutdown(signal) {
+  for (const id of runners.keys()) await stopRunner(id);
+  bot.stop(signal);
+}
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+bot.launch().then(() => console.log('Qureo study bot is running.')).catch(err => {
+  console.error('Bot launch failed:', err.message);
+  process.exit(1);
+});

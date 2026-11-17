@@ -1,0 +1,180 @@
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const config = require('./config');
+
+fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+const file = path.join(config.dataDir, 'users.enc.json');
+const sessions = new Map();
+
+function emptyMeta() {
+  return { users: {}, events: [], blocked: [], paused: [], activationCodes: {}, activated: {}, activationRequests: {} };
+}
+function encrypt(value) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', config.encryptionKey, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(value), 'utf8'), cipher.final()]);
+  return { iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), data: data.toString('base64') };
+}
+function decrypt(payload) {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', config.encryptionKey, Buffer.from(payload.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(payload.tag, 'base64'));
+  return JSON.parse(Buffer.concat([decipher.update(Buffer.from(payload.data, 'base64')), decipher.final()]).toString('utf8'));
+}
+function readAll() {
+  if (!fs.existsSync(file)) return { _meta: emptyMeta() };
+  try {
+    const data = decrypt(JSON.parse(fs.readFileSync(file, 'utf8')));
+    data._meta ||= emptyMeta();
+    const defaults = emptyMeta();
+    for (const [key, value] of Object.entries(defaults)) {
+      if (data._meta[key] == null) data._meta[key] = value;
+    }
+    return data;
+  } catch {
+    throw new Error('تعذر فك تشفير البيانات. تأكد من DATA_ENCRYPTION_KEY الأصلي؛ لا تنشئ مفتاحًا جديدًا.');
+  }
+}
+function writeAll(data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(encrypt(data)), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+  try { fs.chmodSync(file, 0o600); } catch {}
+}
+function saveCredentials(userId, username, password) {
+  const all = readAll(), id = String(userId);
+  all[id] = { username, password, createdAt: all[id]?.createdAt || new Date().toISOString() };
+  all._meta.users[id] ||= { joinedAt: new Date().toISOString(), runs: 0, completed: 0, lastSeen: null };
+  all._meta.users[id].username = username;
+  all._meta.users[id].lastSeen = new Date().toISOString();
+  writeAll(all);
+}
+function getCredentials(userId) { return readAll()[String(userId)] || null; }
+function removeCredentials(userId) { const all = readAll(); delete all[String(userId)]; writeAll(all); }
+function listUsers() {
+  const all = readAll();
+  const meta = all._meta;
+  const ids = new Set([
+    ...Object.keys(all).filter(k => k !== '_meta'),
+    ...Object.keys(meta.users),
+    ...Object.keys(meta.activated),
+    ...Object.keys(meta.activationRequests),
+    ...meta.blocked,
+    ...meta.paused,
+    ...Object.values(meta.activationCodes).map(entry => entry.ownerId)
+  ].filter(id => /^\d+$/.test(String(id))));
+
+  return [...ids].map(id => ({
+    id,
+    ...(meta.users[id] || {}),
+    hasCredentials: !!all[id],
+    blocked: meta.blocked.includes(id),
+    paused: meta.paused.includes(id),
+    activated: meta.activated[id] === true,
+    activationPending: meta.activationRequests[id]?.status === 'pending'
+  })).sort((a, b) => Number(b.id) - Number(a.id));
+}
+
+function isBlocked(userId) { return readAll()._meta.blocked.includes(String(userId)); }
+function setBlocked(userId, blocked) {
+  const all = readAll(), id = String(userId);
+  all._meta.blocked = all._meta.blocked.filter(x => x !== id);
+  if (blocked) all._meta.blocked.push(id);
+  writeAll(all);
+}
+function isPaused(userId) { return readAll()._meta.paused.includes(String(userId)); }
+function setPaused(userId, paused) {
+  const all = readAll(), id = String(userId);
+  all._meta.paused = all._meta.paused.filter(x => x !== id);
+  if (paused) all._meta.paused.push(id);
+  writeAll(all);
+}
+function recordRun(userId, completed, outcome) {
+  const all = readAll(), id = String(userId);
+  all._meta.users[id] ||= { joinedAt: new Date().toISOString(), runs: 0, completed: 0 };
+  const u = all._meta.users[id];
+  u.runs = Number(u.runs || 0) + 1;
+  u.completed = Number(u.completed || 0) + Number(completed || 0);
+  u.lastSeen = new Date().toISOString();
+  u.lastOutcome = String(outcome || 'unknown').slice(0, 180);
+  all._meta.events.unshift({ at: new Date().toISOString(), userId: id, type: 'run', completed: Number(completed || 0), outcome: u.lastOutcome });
+  all._meta.events = all._meta.events.slice(0, 200);
+  writeAll(all);
+}
+function getStats() {
+  const all = readAll(), users = Object.keys(all).filter(k => k !== '_meta');
+  return {
+    users: listUsers().length, blocked: all._meta.blocked.length, paused: all._meta.paused.length,
+    activated: Object.values(all._meta.activated).filter(Boolean).length,
+    runs: all._meta.events.filter(e => e.type === 'run').length,
+    completed: Object.values(all._meta.users).reduce((n, u) => n + Number(u.completed || 0), 0),
+    events: all._meta.events.slice(0, 12)
+  };
+}
+function createActivationCode(ownerId) {
+  const id = String(ownerId || '').trim();
+  if (!/^\d+$/.test(id)) throw new Error('رقم حساب تيليجرام غير صحيح.');
+  const all = readAll();
+  for (const entry of Object.values(all._meta.activationCodes)) {
+    if (entry.ownerId === id && entry.status === 'active') entry.status = 'replaced';
+  }
+  const code = crypto.randomBytes(6).toString('hex').toUpperCase();
+  const hash = crypto.createHash('sha256').update(code).digest('hex');
+  all._meta.activationCodes[hash] = { ownerId: id, status: 'active', createdAt: new Date().toISOString() };
+  all._meta.activated[id] = false;
+  writeAll(all);
+  return code;
+}
+function activateUser(userId, code) {
+  const id = String(userId), normalized = String(code || '').trim().toUpperCase();
+  const hash = crypto.createHash('sha256').update(normalized).digest('hex');
+  const all = readAll(), entry = all._meta.activationCodes[hash];
+  if (!entry) return { ok: false, reason: 'invalid' };
+  if (entry.ownerId !== id) {
+    entry.status = 'compromised';
+    entry.compromisedAt = new Date().toISOString();
+    all._meta.activated[entry.ownerId] = false;
+    writeAll(all);
+    return { ok: false, reason: 'compromised', ownerId: entry.ownerId };
+  }
+  if (entry.status !== 'active') return { ok: false, reason: entry.status === 'compromised' ? 'compromised' : 'used', ownerId: entry.ownerId };
+  entry.status = 'used';
+  entry.usedAt = new Date().toISOString();
+  all._meta.activated[id] = true;
+  writeAll(all);
+  return { ok: true };
+}
+function isActivated(userId) { return readAll()._meta.activated[String(userId)] === true; }
+function revokeActivation(userId) {
+  const id = String(userId), all = readAll();
+  all._meta.activated[id] = false;
+  for (const entry of Object.values(all._meta.activationCodes)) {
+    if (entry.ownerId === id && entry.status === 'active') entry.status = 'revoked';
+  }
+  writeAll(all);
+}
+function requestActivation(userId) {
+  const id = String(userId), all = readAll();
+  if (all._meta.activated[id] === true) return 'activated';
+  if (all._meta.activationRequests[id]) return 'pending';
+  all._meta.activationRequests[id] = { status: 'pending', requestedAt: new Date().toISOString() };
+  writeAll(all);
+  return 'created';
+}
+function listActivationRequests() {
+  const all = readAll();
+  return Object.entries(all._meta.activationRequests)
+    .filter(([, request]) => request.status === 'pending')
+    .map(([id, request]) => ({ id, ...request }));
+}
+function removeActivationRequest(userId) {
+  const all = readAll();
+  delete all._meta.activationRequests[String(userId)];
+  writeAll(all);
+}
+module.exports = {
+  sessions, saveCredentials, getCredentials, removeCredentials, listUsers,
+  isBlocked, setBlocked, isPaused, setPaused, recordRun, getStats,
+  createActivationCode, activateUser, isActivated, revokeActivation,
+  requestActivation, listActivationRequests, removeActivationRequest
+};
